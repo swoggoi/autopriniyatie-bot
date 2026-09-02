@@ -48,99 +48,6 @@ async function handleJoinRequest(env: BotEnv, chatId: string, userId: number, us
 
   await kv.put(processedKey, '1', { expirationTtl: 31536000 });
   console.log(`Заявка ${fullName} (ID: ${userId}) ОДОБРЕНА.`);
-
-  try {
-    await tgRequest(env.BOT_TOKEN, 'sendMessage', 'POST', {
-      chat_id: userId,
-      text: 'Привет! Рад видеть тебя в канале. Твоя заявка одобрена!',
-    });
-    console.log(`Уведомление отправлено ${fullName} (ID: ${userId}).`);
-  } catch (e) {
-    console.log(`Не удалось отправить ЛС ID:${userId}: ${e}`);
-  }
-}
-
-async function handleCommand(env: BotEnv, userId: number, chatId: number, text: string, kv: KVNamespace) {
-  const adminId = parseInt(env.ADMIN_ID, 10);
-  if (!env.ADMIN_ID || userId !== adminId) return;
-
-  if (text === '/status') {
-    let count = 0;
-    const keys = await kv.list({ prefix: 'processed:' });
-    count = keys.keys.length;
-    await tgRequest(env.BOT_TOKEN, 'sendMessage', 'POST', {
-      chat_id: chatId,
-      text: `Бот запущен и работает\n\nID канала: ${env.CHANNEL_ID}\nРежим: автоматическое одобрение заявок\nОбработано за сессию: ${count}`,
-    });
-    console.log(`Команда /status от администратора ${userId}`);
-  }
-
-  if (text === '/chat_id') {
-    await tgRequest(env.BOT_TOKEN, 'sendMessage', 'POST', {
-      chat_id: chatId,
-      text: `Информация о чате:\nID чата: ${chatId}\nТип: private`,
-    });
-    console.log(`Команда /chat_id — chat_id=${chatId}`);
-  }
-
-  if (text.startsWith('/approve_pending')) {
-    const parts = text.trim().split(/\s+/);
-    if (parts.length < 2) {
-      await tgRequest(env.BOT_TOKEN, 'sendMessage', 'POST', {
-        chat_id: chatId,
-        text: 'Использование: /approve_pending user_id1 [user_id2 ...]\nПример: /approve_pending 123456789',
-      });
-      return;
-    }
-
-    let approved = 0;
-    let failed = 0;
-
-    for (let i = 1; i < parts.length; i++) {
-      const uid = parseInt(parts[i], 10);
-      if (isNaN(uid)) {
-        await tgRequest(env.BOT_TOKEN, 'sendMessage', 'POST', {
-          chat_id: chatId,
-          text: `'${parts[i]}' не является валидным ID.`,
-        });
-        continue;
-      }
-
-      try {
-        const res = await tgRequest(env.BOT_TOKEN, 'approveChatJoinRequest', 'POST', {
-          chat_id: env.CHANNEL_ID,
-          user_id: uid,
-        });
-        if (res.ok) {
-          approved++;
-          await kv.put(`processed:${uid}`, '1', { expirationTtl: 31536000 });
-          console.log(`Заявка ID:${uid} одобрена командой /approve_pending`);
-          await tgRequest(env.BOT_TOKEN, 'sendMessage', 'POST', {
-            chat_id: uid,
-            text: 'Привет! Рад видеть тебя в канале. Твоя заявка одобрена!',
-          });
-        } else {
-          failed++;
-          console.error(`Ошибка одобрения ID:${uid}: ${res.description}`);
-        }
-      } catch (e) {
-        failed++;
-        console.error(`Ошибка при одобрении ID:${uid}: ${e}`);
-      }
-    }
-
-    await tgRequest(env.BOT_TOKEN, 'sendMessage', 'POST', {
-      chat_id: chatId,
-      text: `Результат:\n  Одобрено: ${approved}\n  Ошибок: ${failed}`,
-    });
-  }
-}
-
-function handleMyChatMember(data: Record<string, unknown>) {
-  const chat = data.chat as Record<string, unknown>;
-  const newStatus = (data.new_chat_member as Record<string, unknown>)?.status;
-  const oldStatus = (data.old_chat_member as Record<string, unknown>)?.status;
-  console.log(`Статус бота в '${chat.title}' (ID: ${chat.id}): ${oldStatus} -> ${newStatus}`);
 }
 
 const app = new Hono<{ Bindings: { BOT_KV: KVNamespace; BOT_TOKEN: string; ADMIN_ID: string; CHANNEL_ID: string } }>();
@@ -159,8 +66,6 @@ app.post('/webhook', async (c) => {
   }
 
   const chatJoinRequest = update.chat_join_request as Record<string, unknown> | undefined;
-  const message = update.message as Record<string, unknown> | undefined;
-  const myChatMember = update.my_chat_member as Record<string, unknown> | undefined;
 
   if (chatJoinRequest) {
     const fromUser = chatJoinRequest.from as Record<string, unknown>;
@@ -169,21 +74,6 @@ app.post('/webhook', async (c) => {
     const username = (fromUser.username || 'bez_nika') as string;
     const fullName = (fromUser.full_name || 'Bez imeni') as string;
     await handleJoinRequest(env, String(chat.id), userId, username, fullName, kv);
-  }
-
-  if (message) {
-    const fromUser = message.from as Record<string, unknown>;
-    const text = message.text as string | undefined;
-    const chatId = (message.chat as Record<string, unknown>).id as number;
-    const userId = fromUser.id as number;
-
-    if (text && text.startsWith('/')) {
-      await handleCommand(env, userId, chatId, text, kv);
-    }
-  }
-
-  if (myChatMember) {
-    handleMyChatMember(myChatMember);
   }
 
   return c.json({ ok: true });
