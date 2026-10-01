@@ -78,14 +78,6 @@ async function handleJoinRequest(update: Record<string, unknown>, env: Env): Pro
     return;
   }
 
-  const keys = [`processed:${chatId}:${userId}`, `processed:${userId}`];
-  for (const key of keys) {
-    if (await kvGet(env.BOT_KV, key)) {
-      console.log(`JOIN duplicate: user=${userId} @${username} (key=${key})`);
-      return;
-    }
-  }
-
   const { status, data } = await tgCall(env.BOT_TOKEN, 'approveChatJoinRequest', {
     chat_id: chatId,
     user_id: userId,
@@ -93,18 +85,23 @@ async function handleJoinRequest(update: Record<string, unknown>, env: Env): Pro
 
   if (data.ok) {
     console.log(`JOIN approved: user=${userId} @${username} (${fullName})`);
-    for (const key of keys) {
-      try {
-        await env.BOT_KV?.put(key, String(Date.now()), { expirationTtl: 31536000 });
-      } catch (err) {
-        console.error(`KV_PUT_FAIL key=${key} (approval still went through)`, err);
-      }
+    try {
+      await env.BOT_KV?.put(`processed:${chatId}:${userId}`, String(Date.now()), {
+        expirationTtl: 31536000,
+      });
+    } catch (err) {
+      console.error(`KV_PUT_FAIL (approval still went through)`, err);
     }
   } else {
+  const benign = /ALREADY_PARTICIPANT|USER_ALREADY_PARTICIPANT|CHAT_ADMIN_REQUIRED|TOPIC_CLOSED/i;
+  if (!benign.test(data.description ?? '')) {
     console.error(
       `JOIN NOT approved: user=${userId} @${username} http=${status} description=${data.description ?? '?'}`,
     );
+  } else {
+    console.log(`JOIN already settled: user=${userId} @${username} (${data.description})`);
   }
+}
 }
 
 function handleMyChatMember(update: Record<string, unknown>): void {
