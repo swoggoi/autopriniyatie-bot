@@ -170,11 +170,10 @@ export async function recordChannelMember(
       .prepare(
         `UPDATE users SET
            source_channel_id = COALESCE(source_channel_id, ?),
-           approved_at = CASE WHEN ? = 1 THEN COALESCE(approved_at, ?) ELSE approved_at END,
            updated_at = ?
          WHERE telegram_id = ?`,
       )
-      .bind(channelId, active ? 1 : 0, now, now, from.id),
+      .bind(channelId, now, from.id),
   ]);
 }
 
