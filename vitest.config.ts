@@ -13,6 +13,7 @@ export default defineConfig({
           ADMIN_BOT_TOKEN: '9000398776:TEST',
           ADMIN_IDS: '8406606797',
           CHANNEL_ID: '-1004416682870',
+          CHANNEL_IDS: '-1004416682870,-1004374130055',
           WEBHOOK_SECRET: 'test-main-secret',
           ADMIN_WEBHOOK_SECRET: 'test-admin-secret',
           DIAG_KEY: 'test-diag-key',

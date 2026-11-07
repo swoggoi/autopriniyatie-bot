@@ -4,7 +4,7 @@ Telegram-бот на Cloudflare Workers: автоматически приним
 
 ## Возможности
 
-- Автоматическое одобрение заявок на вступление в канал `CHANNEL_ID`.
+- Автоматическое одобрение заявок на вступление в один или несколько каналов (`CHANNEL_IDS`, резервный `CHANNEL_ID`).
 - Приветственное сообщение после одобрения:
   - отправка через `user_chat_id` из заявки;
   - резервная отправка в известный приватный чат;
@@ -39,7 +39,7 @@ Telegram-бот на Cloudflare Workers: автоматически приним
 Обработчики:
 
 - `src/index.ts` — маршрутизация, webhook-и, queue и scheduled.
-- `src/main-bot.ts` — заявки, `/start`, согласие, `my_chat_member`.
+- `src/main-bot.ts` — заявки, `/start`, согласие, `my_chat_member`, `chat_member`.
 - `src/admin-bot.ts` — FSM админ-бота, меню, конструктор рассылок, ссылки, приветствие.
 - `src/broadcast.ts` — очередь, движок рассылки, cron-восстановление.
 - `src/welcome.ts` — приветствие и классификация ошибок доставки.
@@ -74,7 +74,8 @@ Telegram-бот на Cloudflare Workers: автоматически приним
 | `MAIN_BOT_TOKEN` | да | токен основного бота |
 | `ADMIN_BOT_TOKEN` | да | токен админ-бота |
 | `ADMIN_IDS` | да | Telegram ID админов через запятую |
-| `CHANNEL_ID` | да | ID канала, например `-100...` |
+| `CHANNEL_IDS` | рекомендуется | несколько ID каналов через запятую; имеет приоритет над `CHANNEL_ID` |
+| `CHANNEL_ID` | да* | ID канала, если `CHANNEL_IDS` не задан |
 | `WEBHOOK_SECRET` | рекомендуется | `secret_token` для `/webhook` |
 | `ADMIN_WEBHOOK_SECRET` | рекомендуется | `secret_token` для `/admin/webhook` |
 | `DIAG_KEY` | опционально | ключ для `/diagnose` |
@@ -96,6 +97,7 @@ MAIN_BOT_TOKEN=123:main
 ADMIN_BOT_TOKEN=456:admin
 ADMIN_IDS=8406606797
 CHANNEL_ID=-1004416682870
+CHANNEL_IDS=-1004416682870,-1004374130055
 WEBHOOK_SECRET=dev-main-secret
 ADMIN_WEBHOOK_SECRET=dev-admin-secret
 DIAG_KEY=dev-diag-key
@@ -124,7 +126,7 @@ npm test
 
 Тесты используют Vitest с Workers pool, локальный D1 и фейковые токены `8606393164:TEST` / `9000398776:TEST`. Реальные запросы в Telegram не отправляются: исходящий `fetch` подменяется в `test/telegram-mock.ts`.
 
-Покрыто 33 теста:
+Покрыто 37 тестов:
 
 - HTTP-слой, проверка секретов, health;
 - регистрация через `/start`, одобрение заявки;
@@ -142,9 +144,10 @@ npm run db:migrate:local
 npm run db:migrate:remote
 ```
 
-Схема находится в `migrations/0001_init.sql`:
+Схема находится в `migrations/0001_init.sql` и `migrations/0002_multi_channel.sql`:
 
-- `users` — пользователи, статус личных сообщений, согласие;
+- `users` — пользователи, статус личных сообщений, согласие, исходный канал;
+- `channel_members` — членство в каждом канале (`requested`, `member`, `left`, ...);
 - `messages` — журнал отправок и `dedupe_key`;
 - `broadcasts` — рассылки и счётчики;
 - `broadcast_recipients` — получатели и статусы;
@@ -168,7 +171,7 @@ npx wrangler d1 migrations apply autopriniyatie-bot-db --remote
 npx wrangler secret put MAIN_BOT_TOKEN
 npx wrangler secret put ADMIN_BOT_TOKEN
 npx wrangler secret put ADMIN_IDS
-npx wrangler secret put CHANNEL_ID
+npx wrangler secret put CHANNEL_IDS
 npx wrangler secret put WEBHOOK_SECRET
 npx wrangler secret put ADMIN_WEBHOOK_SECRET
 npx wrangler secret put DIAG_KEY
@@ -186,7 +189,7 @@ npm run deploy
 curl "https://api.telegram.org/bot$MAIN_BOT_TOKEN/setWebhook" \
   -d "url=https://autopriniyatie-bot.zenaahont8.workers.dev/webhook" \
   -d "secret_token=$WEBHOOK_SECRET" \
-  -d 'allowed_updates=["chat_join_request","message","callback_query","my_chat_member"]'
+  -d 'allowed_updates=["chat_join_request","chat_member","message","callback_query","my_chat_member"]'
 
 curl "https://api.telegram.org/bot$ADMIN_BOT_TOKEN/setWebhook" \
   -d "url=https://autopriniyatie-bot.zenaahont8.workers.dev/admin/webhook" \
@@ -213,13 +216,23 @@ curl -H "X-Diag-Key: $DIAG_KEY" https://autopriniyatie-bot.zenaahont8.workers.de
 - **Ссылки на каналы** — CRUD, slug, URL, активность. Ссылки используются в кнопках и плейсхолдерах `{link:slug}`.
 - **Приветственное сообщение** — текст/фото/видео, подпись, формат, кнопки, тест, сброс.
 - **Пользователи** — последние пользователи и поиск по ID/username.
-- **Настройки** — скорость рассылки, диагностика Telegram.
+- **Настройки** — каналы и статистика по ним, скорость рассылки, диагностика Telegram.
+
+## Какие пользователи попадают в базу
+
+Bot API не отдаёт список подписчиков канала. Бот узнаёт пользователя только когда:
+
+- он подал заявку на вступление по ссылке с одобрением (`chat_join_request`) — основной путь;
+- он нажал `/start` или написал основному боту;
+- Telegram прислал `chat_member` (для каналов работает нестабильно и не гарантируется).
+
+Подписчики, которые уже состоят в канале и никогда не взаимодействовали с ботом, в базу не попадают. Бот также не может написать им первым: Telegram запрещает инициативные личные сообщения, пока пользователь не запустил бота. Для конверсии закрепите в канале ссылку вида `https://t.me/<bot>?start=channel`.
 
 ### Сегменты аудитории
 
 | Сегмент | Кто получает |
 | --- | --- |
-| `all_allowed` | все, кому можно писать (`can_receive_messages = 1`) |
+| `all_allowed` | все, кому можно писать (`can_receive_messages = 1`), из всех каналов |
 | `started` | запускавшие бота |
 | `approved` | одобренные заявки |
 | `consented` | явно согласившиеся на рассылки |

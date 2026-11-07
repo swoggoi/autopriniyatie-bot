@@ -9,8 +9,9 @@ import {
 import { audienceWhere, resolveLinkPlaceholders, resolveStoredButtons } from '../src/db';
 import { contentFromMessage, parseButtons } from '../src/admin-bot';
 import { buildWelcomeContent } from '../src/welcome';
+import { getChannelIds } from '../src/env';
 import type { ChannelLink, LinkMap } from '../src/db';
-import type { TelegramMessage, WelcomeConfig } from '../src/types';
+import type { Env, TelegramMessage, WelcomeConfig } from '../src/types';
 
 describe('telegram helpers', () => {
   it('splits long messages into <=3900 char chunks', () => {
@@ -56,6 +57,19 @@ describe('audience segments', () => {
     expect(audienceWhere('consented', []).sql).toContain('consent_broadcasts = 1');
     expect(audienceWhere('test', [1, 2]).params).toEqual([1, 2]);
     expect(audienceWhere('test', []).sql).toBe('0 = 1');
+  });
+});
+
+describe('channel configuration', () => {
+  it('reads CHANNEL_IDS and falls back to CHANNEL_ID', () => {
+    const base = { CHANNEL_ID: '-1004416682870' } as Env;
+    expect(getChannelIds(base)).toEqual(['-1004416682870']);
+    expect(
+      getChannelIds({
+        ...base,
+        CHANNEL_IDS: '-1004374130055, -1004416682870; -1004374130055',
+      }),
+    ).toEqual(['-1004374130055', '-1004416682870']);
   });
 });
 

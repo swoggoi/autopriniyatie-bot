@@ -112,19 +112,105 @@ export async function recordJoinRequest(
   from: TelegramUser,
   userChatId: number | undefined,
   date: number,
+  channelId: number,
 ): Promise<void> {
   await upsertUser(db, from);
   const now = nowIso();
-  await db
+  const requestedAt = new Date(date * 1000).toISOString();
+  await db.batch([
+    db
+      .prepare(
+        `UPDATE users SET
+           join_requested_at = ?,
+           private_chat_id = COALESCE(?, private_chat_id),
+           source_channel_id = COALESCE(source_channel_id, ?),
+           updated_at = ?
+         WHERE telegram_id = ?`,
+      )
+      .bind(requestedAt, userChatId ?? null, channelId, now, from.id),
+    db
+      .prepare(
+        `INSERT INTO channel_members (channel_id, telegram_id, status, joined_at, updated_at)
+         VALUES (?, ?, 'requested', NULL, ?)
+         ON CONFLICT(channel_id, telegram_id) DO UPDATE SET
+           status = 'requested',
+           updated_at = excluded.updated_at`,
+      )
+      .bind(channelId, from.id, now),
+  ]);
+}
+
+/**
+ * Records a membership status discovered from a chat_member update or after
+ * approving a join request. Does not change DM reachability: a user still has
+ * to start the bot (or receive the welcome) before broadcasts can reach them.
+ */
+export async function recordChannelMember(
+  db: D1Database,
+  from: TelegramUser,
+  channelId: number,
+  status: string,
+  at?: string,
+): Promise<void> {
+  await upsertUser(db, from);
+  const now = nowIso();
+  const active = status === 'member' || status === 'administrator' || status === 'creator';
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO channel_members (channel_id, telegram_id, status, joined_at, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(channel_id, telegram_id) DO UPDATE SET
+           status = excluded.status,
+           joined_at = COALESCE(channel_members.joined_at, excluded.joined_at),
+           updated_at = excluded.updated_at`,
+      )
+      .bind(channelId, from.id, status, active ? (at ?? now) : null, now),
+    db
+      .prepare(
+        `UPDATE users SET
+           source_channel_id = COALESCE(source_channel_id, ?),
+           approved_at = CASE WHEN ? = 1 THEN COALESCE(approved_at, ?) ELSE approved_at END,
+           updated_at = ?
+         WHERE telegram_id = ?`,
+      )
+      .bind(channelId, active ? 1 : 0, now, now, from.id),
+  ]);
+}
+
+export interface ChannelStat {
+  channelId: number;
+  /** Users currently recorded as members (or with a pending request). */
+  known: number;
+  /** Of those, users who can actually receive direct messages. */
+  broadcastable: number;
+}
+
+export async function getChannelStats(
+  db: D1Database,
+  channelIds: number[],
+): Promise<ChannelStat[]> {
+  const ids = [...new Set(channelIds.filter((id) => Number.isFinite(id)))];
+  if (!ids.length) return [];
+  const placeholders = ids.map(() => '?').join(', ');
+  const res = await db
     .prepare(
-      `UPDATE users SET
-         join_requested_at = ?,
-         private_chat_id = COALESCE(?, private_chat_id),
-         updated_at = ?
-       WHERE telegram_id = ?`,
+      `SELECT cm.channel_id,
+              COUNT(*) AS known,
+              COALESCE(SUM(CASE WHEN u.can_receive_messages = 1 AND u.dm_status = 'allowed' THEN 1 ELSE 0 END), 0) AS broadcastable
+         FROM channel_members cm
+         LEFT JOIN users u ON u.telegram_id = cm.telegram_id
+        WHERE cm.channel_id IN (${placeholders})
+          AND cm.status IN ('requested', 'member', 'administrator', 'creator')
+        GROUP BY cm.channel_id`,
     )
-    .bind(new Date(date * 1000).toISOString(), userChatId ?? null, now, from.id)
-    .run();
+    .bind(...ids)
+    .all<{ channel_id: number; known: number; broadcastable: number }>();
+  return (res.results ?? []).map((row) => ({
+    channelId: Number(row.channel_id),
+    known: Number(row.known ?? 0),
+    broadcastable: Number(row.broadcastable ?? 0),
+  }));
 }
 
 export async function markApproved(db: D1Database, userId: number): Promise<void> {
@@ -205,6 +291,7 @@ export interface UserRow {
   consent_at: string | null;
   consent_source: string | null;
   last_error: string | null;
+  source_channel_id: number | null;
 }
 
 export async function getUser(db: D1Database, userId: number): Promise<UserRow | null> {

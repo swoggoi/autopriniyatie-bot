@@ -2,7 +2,7 @@ import type { Env, QueueJob, TelegramUpdate } from './types';
 import { handleMainUpdate } from './main-bot';
 import { handleAdminUpdate } from './admin-bot';
 import { handleQueue, handleScheduled } from './broadcast';
-import { checkSecret, getAdminIds, getAdminToken, getMainToken } from './env';
+import { checkSecret, getAdminIds, getAdminToken, getChannelIds, getMainToken } from './env';
 import { tgCall } from './telegram';
 import { getStats } from './db';
 
@@ -31,6 +31,7 @@ async function runDiagnostics(env: Env): Promise<Record<string, unknown>> {
     hasMainToken: Boolean(mainToken),
     hasAdminToken: Boolean(adminToken),
     channelId: env.CHANNEL_ID,
+    channelIds: getChannelIds(env),
     adminIds: getAdminIds(env),
     checks: {},
   };
@@ -66,21 +67,27 @@ async function runDiagnostics(env: Env): Promise<Record<string, unknown>> {
       }
     : { ok: false, http: adminWebhook.status, description: adminWebhook.description };
 
-  const chat = await tgCall(mainToken, 'getChat', { chat_id: env.CHANNEL_ID });
-  checks.chat = chat.ok
-    ? { ok: true, id: (chat.result as { id?: number })?.id, title: (chat.result as { title?: string })?.title }
-    : { ok: false, http: chat.status, description: chat.description };
-
-  if (mainMe.ok) {
-    const botId = (mainMe.result as { id?: number })?.id;
-    const member = await tgCall(mainToken, 'getChatMember', {
-      chat_id: env.CHANNEL_ID,
-      user_id: botId,
-    });
-    checks.botMembership = member.ok
-      ? { ok: true, status: (member.result as { status?: string })?.status }
-      : { ok: false, http: member.status, description: member.description };
+  const botId = mainMe.ok ? (mainMe.result as { id?: number })?.id : undefined;
+  const channelChecks: Record<string, unknown> = {};
+  for (const channelId of getChannelIds(env)) {
+    const chat = await tgCall(mainToken, 'getChat', { chat_id: channelId });
+    const item: Record<string, unknown> = chat.ok
+      ? { ok: true, id: (chat.result as { id?: number })?.id, title: (chat.result as { title?: string })?.title }
+      : { ok: false, http: chat.status, description: chat.description };
+    if (botId) {
+      const member = await tgCall(mainToken, 'getChatMember', {
+        chat_id: channelId,
+        user_id: botId,
+      });
+      item.botMembership = member.ok
+        ? { ok: true, status: (member.result as { status?: string })?.status }
+        : { ok: false, http: member.status, description: member.description };
+      const count = await tgCall(mainToken, 'getChatMemberCount', { chat_id: channelId });
+      item.memberCount = count.ok ? count.result : null;
+    }
+    channelChecks[channelId] = item;
   }
+  checks.channels = channelChecks;
 
   try {
     checks.stats = await getStats(env.DB);
@@ -115,6 +122,7 @@ export default {
         hasMainToken: Boolean(getMainToken(env)),
         hasAdminToken: Boolean(getAdminToken(env)),
         channelId: env.CHANNEL_ID,
+        channelIds: getChannelIds(env),
         kvBound: Boolean(env.BOT_KV),
         dbBound: Boolean(env.DB),
         queueBound: Boolean(env.BROADCAST_QUEUE),

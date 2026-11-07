@@ -33,6 +33,7 @@ const MAIN_TOKEN = '8606393164:TEST';
 const ADMIN_TOKEN = '9000398776:TEST';
 const ADMIN_ID = 8406606797;
 const CHANNEL_ID = '-1004416682870';
+const SECOND_CHANNEL_ID = '-1004374130055';
 const MAIN_SECRET = 'test-main-secret';
 const ADMIN_SECRET = 'test-admin-secret';
 
@@ -166,6 +167,7 @@ beforeEach(async () => {
     env.DB.prepare('DELETE FROM broadcast_recipients'),
     env.DB.prepare('DELETE FROM broadcasts'),
     env.DB.prepare('DELETE FROM messages'),
+    env.DB.prepare('DELETE FROM channel_members'),
     env.DB.prepare('DELETE FROM users'),
     env.DB.prepare('DELETE FROM admin_sessions'),
     env.DB.prepare('DELETE FROM channel_links'),
@@ -232,6 +234,79 @@ describe('HTTP layer', () => {
     expect(user?.approved_at).toBeTruthy();
     expect(user?.join_requested_at).toBeTruthy();
     expect(user?.private_chat_id).toBe(222);
+  });
+
+  it('approves join requests from every configured channel', async () => {
+    intercept(MAIN_TOKEN, 'approveChatJoinRequest', 1, { data: { ok: true, result: true } });
+    const date = Math.floor(Date.now() / 1000);
+    const update: TelegramUpdate = {
+      update_id: nextUpdateId(),
+      chat_join_request: {
+        chat: { id: Number(SECOND_CHANNEL_ID), type: 'channel', title: 'Second channel' },
+        from: { id: 223, first_name: 'Second', username: 'second223' },
+        user_chat_id: 223,
+        date,
+      },
+    };
+    const res = await postWebhook('/webhook', update, MAIN_SECRET);
+    expect(res.status).toBe(200);
+
+    const user = await getUser(env.DB, 223);
+    expect(user?.approved_at).toBeTruthy();
+    expect(user?.source_channel_id).toBe(Number(SECOND_CHANNEL_ID));
+
+    const membership = await env.DB.prepare(
+      'SELECT status, joined_at FROM channel_members WHERE channel_id = ? AND telegram_id = ?',
+    )
+      .bind(Number(SECOND_CHANNEL_ID), 223)
+      .first<{ status: string; joined_at: string | null }>();
+    expect(membership?.status).toBe('member');
+    expect(membership?.joined_at).toBeTruthy();
+  });
+
+  it('ignores join requests from channels that are not configured', async () => {
+    const update: TelegramUpdate = {
+      update_id: nextUpdateId(),
+      chat_join_request: {
+        chat: { id: -1009999999999, type: 'channel', title: 'Other channel' },
+        from: { id: 224, first_name: 'Other', username: 'other224' },
+        user_chat_id: 224,
+        date: Math.floor(Date.now() / 1000),
+      },
+    };
+    const res = await postWebhook('/webhook', update, MAIN_SECRET);
+    expect(res.status).toBe(200);
+    expect(await getUser(env.DB, 224)).toBeNull();
+  });
+
+  it('records channel membership from chat_member updates without marking DMs reachable', async () => {
+    const date = Math.floor(Date.now() / 1000);
+    const update: TelegramUpdate = {
+      update_id: nextUpdateId(),
+      chat_member: {
+        chat: { id: Number(SECOND_CHANNEL_ID), type: 'channel', title: 'Second channel' },
+        from: { id: 225, first_name: 'Member', username: 'member225' },
+        date,
+        old_chat_member: { status: 'left' },
+        new_chat_member: {
+          status: 'member',
+          user: { id: 225, first_name: 'Member', username: 'member225' },
+        },
+      },
+    };
+    const res = await postWebhook('/webhook', update, MAIN_SECRET);
+    expect(res.status).toBe(200);
+
+    const user = await getUser(env.DB, 225);
+    expect(user?.source_channel_id).toBe(Number(SECOND_CHANNEL_ID));
+    expect(user?.can_receive_messages).toBe(0);
+
+    const membership = await env.DB.prepare(
+      'SELECT status FROM channel_members WHERE channel_id = ? AND telegram_id = ?',
+    )
+      .bind(Number(SECOND_CHANNEL_ID), 225)
+      .first<{ status: string }>();
+    expect(membership?.status).toBe('member');
   });
 
   it('denies non-admin users of the admin bot', async () => {

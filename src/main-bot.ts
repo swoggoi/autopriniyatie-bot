@@ -5,12 +5,13 @@ import {
   markApproved,
   markStarted,
   recordJoinRequest,
+  recordChannelMember,
   ensureUser,
   setConsent,
   setDmStatus,
   getUser,
 } from './db';
-import { getMainToken } from './env';
+import { getChannelIds, getMainToken } from './env';
 import { answerCallback, editText, escapeHtml, isBenignApprovalError, sendText, tgCall } from './telegram';
 import { processWelcomeJob } from './welcome';
 import { CONSENT_TEXT } from './defaults';
@@ -172,12 +173,13 @@ async function handleJoinRequest(
     return;
   }
 
-  if (chatId !== String(env.CHANNEL_ID)) {
-    console.warn(`JOIN skipped: chat ${chatId} != configured CHANNEL_ID`);
+  const channelIds = getChannelIds(env);
+  if (!channelIds.includes(chatId)) {
+    console.warn(`JOIN skipped: chat ${chatId} not in configured channels [${channelIds.join(', ')}]`);
     return;
   }
 
-  await recordJoinRequest(env.DB, from, update.user_chat_id, update.date);
+  await recordJoinRequest(env.DB, from, update.user_chat_id, update.date, Number(chatId));
 
   const approval = await tgCall(token, 'approveChatJoinRequest', {
     chat_id: chatId,
@@ -193,6 +195,7 @@ async function handleJoinRequest(
   }
 
   await markApproved(env.DB, from.id);
+  await recordChannelMember(env.DB, from, Number(chatId), 'member');
 
   const job = {
     type: 'welcome' as const,
@@ -220,6 +223,33 @@ async function handleJoinRequest(
   );
 }
 
+/**
+ * Best-effort channel subscription tracking. Telegram does not guarantee
+ * `chat_member` updates for channels; join requests remain the primary source.
+ * This handler only records membership and never marks a user as DM-reachable.
+ */
+async function handleChatMember(
+  env: Env,
+  update: NonNullable<TelegramUpdate['chat_member']>,
+): Promise<void> {
+  const chatId = String(update.chat.id);
+  const channelIds = getChannelIds(env);
+  if (!channelIds.includes(chatId)) return;
+
+  const user = update.new_chat_member?.user ?? update.from;
+  if (!user?.id || user.is_bot) return;
+
+  const status = update.new_chat_member?.status ?? 'unknown';
+  await recordChannelMember(
+    env.DB,
+    user,
+    Number(chatId),
+    status,
+    new Date(update.date * 1000).toISOString(),
+  );
+  console.log(`CHANNEL_MEMBER ${status}: user=${user.id} @${user.username ?? 'no_nick'} chat=${chatId}`);
+}
+
 async function handleMyChatMember(
   env: Env,
   update: NonNullable<TelegramUpdate['my_chat_member']>,
@@ -243,6 +273,10 @@ export async function handleMainUpdate(
 ): Promise<void> {
   if (update.chat_join_request) {
     await handleJoinRequest(env, update.chat_join_request, ctx);
+    return;
+  }
+  if (update.chat_member) {
+    await handleChatMember(env, update.chat_member);
     return;
   }
   if (update.my_chat_member) {

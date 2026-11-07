@@ -8,7 +8,10 @@ export interface Env {
   ADMIN_IDS?: string;
   /** Legacy single-admin variable. */
   ADMIN_ID?: string;
+  /** Primary channel ID, kept for backward compatibility. */
   CHANNEL_ID: string;
+  /** Comma-separated list of channels the bot serves (overrides CHANNEL_ID). */
+  CHANNEL_IDS?: string;
   BOT_KV?: KVNamespace;
   DB: D1Database;
   BROADCAST_QUEUE: Queue<QueueJob>;
@@ -147,6 +150,13 @@ export interface TelegramUpdate {
     date: number;
     old_chat_member?: { status: string };
     new_chat_member?: { status: string };
+  };
+  chat_member?: {
+    chat: TelegramChat;
+    from: TelegramUser;
+    date: number;
+    old_chat_member?: { status: string; user?: TelegramUser };
+    new_chat_member?: { status: string; user?: TelegramUser };
   };
 }
 

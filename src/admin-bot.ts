@@ -23,6 +23,7 @@ import {
   findUser,
   getBroadcast,
   getBroadcastRate,
+  getChannelStats,
   getLink,
   getLinkMap,
   getSession,
@@ -41,7 +42,7 @@ import {
   stopBroadcast,
   updateLink,
 } from './db';
-import { getAdminIds, getAdminToken, getMainToken, isAdmin } from './env';
+import { getAdminIds, getAdminToken, getChannelIds, getMainToken, isAdmin } from './env';
 import {
   answerCallback,
   classifyTelegramError,
@@ -365,9 +366,19 @@ async function showUsers(env: Env, chatId: number, messageId?: number): Promise<
 async function showSettings(env: Env, chatId: number, messageId?: number): Promise<void> {
   const rate = await getBroadcastRate(env.DB);
   const stats = await getStats(env.DB);
+  const channelIds = getChannelIds(env);
+  const channelStats = await getChannelStats(env.DB, channelIds.map(Number));
+  const channelLines = channelIds.length
+    ? channelIds
+        .map((id) => {
+          const stat = channelStats.find((item) => item.channelId === Number(id));
+          return `• <code>${escapeHtml(id)}</code> — известно: ${stat?.known ?? 0}, можно писать: ${stat?.broadcastable ?? 0}`;
+        })
+        .join('\n')
+    : 'не заданы';
   const text =
     '<b>⚙️ Настройки</b>\n\n' +
-    `Канал: <code>${escapeHtml(env.CHANNEL_ID)}</code>\n` +
+    `<b>Каналы</b>\n${channelLines}\n\n` +
     `Администраторы: <code>${getAdminIds(env).join(', ') || 'не заданы'}</code>\n` +
     `Скорость рассылки: <b>${rate} сообщений/сек</b>\n` +
     `Пользователей в базе: ${stats.total}\n` +
@@ -692,28 +703,66 @@ async function runDiagnostics(env: Env, chatId: number): Promise<void> {
   const mainToken = getMainToken(env);
   const adminTokenValue = adminToken(env);
   const lines = ['<b>🩺 Диагностика</b>', ''];
-  const checks: Array<[string, Promise<import('./telegram').TgResult>]> = [
-    ['main getMe', tgCall(mainToken, 'getMe')],
-    ['main webhook', tgCall(mainToken, 'getWebhookInfo')],
-    ['admin getMe', tgCall(adminTokenValue, 'getMe')],
-    ['admin webhook', tgCall(adminTokenValue, 'getWebhookInfo')],
-    ['channel', tgCall(mainToken, 'getChat', { chat_id: env.CHANNEL_ID })],
-  ];
 
-  for (const [label, promise] of checks) {
-    const res = await promise;
-    if (res.ok) {
-      const result = res.result as Record<string, unknown> | undefined;
-      if (label.endsWith('getMe')) {
-        lines.push(`✅ ${label}: @${escapeHtml(String(result?.username ?? '?'))}`);
-      } else if (label.endsWith('webhook')) {
-        lines.push(`✅ ${label}: ${escapeHtml(truncate(String(result?.url ?? 'не установлен'), 90))}`);
-      } else {
-        lines.push(`✅ ${label}: ${escapeHtml(String(result?.title ?? result?.id ?? 'ok'))}`);
-      }
-    } else {
-      lines.push(`❌ ${label}: ${escapeHtml(truncate(res.description ?? 'unknown', 160))}`);
+  const mainMe = await tgCall(mainToken, 'getMe');
+  lines.push(
+    mainMe.ok
+      ? `✅ main getMe: @${escapeHtml(String((mainMe.result as { username?: string })?.username ?? '?'))}`
+      : `❌ main getMe: ${escapeHtml(truncate(mainMe.description ?? 'unknown', 160))}`,
+  );
+
+  const mainWebhook = await tgCall(mainToken, 'getWebhookInfo');
+  if (mainWebhook.ok) {
+    const info = mainWebhook.result as { url?: string; allowed_updates?: string[] } | undefined;
+    lines.push(`✅ main webhook: ${escapeHtml(truncate(String(info?.url ?? 'не установлен'), 90))}`);
+    const updates = info?.allowed_updates;
+    lines.push(
+      `ℹ️ allowed_updates: ${escapeHtml(updates?.length ? updates.join(', ') : 'все, кроме chat_member')}`,
+    );
+  } else {
+    lines.push(`❌ main webhook: ${escapeHtml(truncate(mainWebhook.description ?? 'unknown', 160))}`);
+  }
+
+  const adminMe = await tgCall(adminTokenValue, 'getMe');
+  lines.push(
+    adminMe.ok
+      ? `✅ admin getMe: @${escapeHtml(String((adminMe.result as { username?: string })?.username ?? '?'))}`
+      : `❌ admin getMe: ${escapeHtml(truncate(adminMe.description ?? 'unknown', 160))}`,
+  );
+
+  const adminWebhook = await tgCall(adminTokenValue, 'getWebhookInfo');
+  lines.push(
+    adminWebhook.ok
+      ? `✅ admin webhook: ${escapeHtml(truncate(String((adminWebhook.result as { url?: string })?.url ?? 'не установлен'), 90))}`
+      : `❌ admin webhook: ${escapeHtml(truncate(adminWebhook.description ?? 'unknown', 160))}`,
+  );
+
+  const botId = mainMe.ok ? (mainMe.result as { id?: number })?.id : undefined;
+  const channelIds = getChannelIds(env);
+  if (!channelIds.length) {
+    lines.push('❌ Каналы: не заданы');
+  }
+  for (const channelId of channelIds) {
+    const chat = await tgCall(mainToken, 'getChat', { chat_id: channelId });
+    if (!chat.ok) {
+      lines.push(
+        `❌ Канал ${escapeHtml(channelId)}: ${escapeHtml(truncate(chat.description ?? 'unknown', 160))}`,
+      );
+      continue;
     }
+    const title = String((chat.result as { title?: string })?.title ?? channelId);
+    let memberStatus = '?';
+    if (botId) {
+      const member = await tgCall(mainToken, 'getChatMember', { chat_id: channelId, user_id: botId });
+      memberStatus = member.ok
+        ? String((member.result as { status?: string })?.status ?? '?')
+        : `ошибка: ${member.description ?? '?'}`;
+    }
+    const count = await tgCall(mainToken, 'getChatMemberCount', { chat_id: channelId });
+    const memberCount = count.ok ? String(count.result) : '?';
+    lines.push(
+      `✅ Канал ${escapeHtml(channelId)} «${escapeHtml(title)}»: бот ${escapeHtml(memberStatus)}, подписчиков: ${escapeHtml(memberCount)}`,
+    );
   }
 
   try {
