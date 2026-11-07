@@ -368,17 +368,20 @@ async function showSettings(env: Env, chatId: number, messageId?: number): Promi
   const stats = await getStats(env.DB);
   const channelIds = getChannelIds(env);
   const channelStats = await getChannelStats(env.DB, channelIds.map(Number));
-  const channelLines = channelIds.length
-    ? channelIds
-        .map((id) => {
-          const stat = channelStats.find((item) => item.channelId === Number(id));
-          return `• <code>${escapeHtml(id)}</code> — известно: ${stat?.known ?? 0}, можно писать: ${stat?.broadcastable ?? 0}`;
-        })
-        .join('\n')
-    : 'не заданы';
+  const mainToken = getMainToken(env);
+  const channelLines: string[] = [];
+  for (const id of channelIds) {
+    const stat = channelStats.find((item) => item.channelId === Number(id));
+    const count = await tgCall(mainToken, 'getChatMemberCount', { chat_id: id });
+    const total = count.ok ? String(count.result) : '?';
+    channelLines.push(
+      `• <code>${escapeHtml(id)}</code> — подписчиков: ${escapeHtml(total)}, известно боту: ${stat?.known ?? 0}, можно писать: ${stat?.broadcastable ?? 0}`,
+    );
+  }
+  const channelText = channelLines.length ? channelLines.join('\n') : 'не заданы';
   const text =
     '<b>⚙️ Настройки</b>\n\n' +
-    `<b>Каналы</b>\n${channelLines}\n\n` +
+    `<b>Каналы</b>\n${channelText}\n\n` +
     `Администраторы: <code>${getAdminIds(env).join(', ') || 'не заданы'}</code>\n` +
     `Скорость рассылки: <b>${rate} сообщений/сек</b>\n` +
     `Пользователей в базе: ${stats.total}\n` +
