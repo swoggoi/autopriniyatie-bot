@@ -3,6 +3,8 @@ bot_telegram/
 dist/
 .env
 .env.local
+.dev.vars
+.wrangler/
 *.log
 .DS_Store
 Thumbs.db

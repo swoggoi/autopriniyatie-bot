@@ -1,174 +1,105 @@
-interface Env {
-  BOT_TOKEN: string;
-  ADMIN_ID: string;
-  CHANNEL_ID: string;
-  BOT_KV: KVNamespace;
-  WEBHOOK_SECRET?: string;
-  DIAG_KEY?: string;
-}
-
-interface TelegramResponse {
-  ok: boolean;
-  description?: string;
-  error_code?: number;
-  result?: unknown;
-}
-
-interface CallResult {
-  status: number;
-  data: TelegramResponse;
-}
+import type { Env, QueueJob, TelegramUpdate } from './types';
+import { handleMainUpdate } from './main-bot';
+import { handleAdminUpdate } from './admin-bot';
+import { handleQueue, handleScheduled } from './broadcast';
+import { checkSecret, getAdminIds, getAdminToken, getMainToken } from './env';
+import { tgCall } from './telegram';
+import { getStats } from './db';
 
 const json = (data: unknown, status = 200): Response =>
   new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
   });
 
-async function tgCall(token: string, method: string, body?: unknown): Promise<CallResult> {
-  const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body ?? {}),
-  });
+const text = (body: string, status = 200): Response =>
+  new Response(body, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
 
-  let data: TelegramResponse;
+async function readUpdate(request: Request): Promise<TelegramUpdate | null> {
   try {
-    data = (await res.json()) as TelegramResponse;
+    return (await request.json()) as TelegramUpdate;
   } catch {
-    data = { ok: false, description: `non-JSON reply to ${method} (HTTP ${res.status})` };
-  }
-
-  if (!data.ok) {
-    console.error(
-      `TG_FAIL method=${method} http=${res.status} error_code=${data.error_code ?? '?'} description=${data.description ?? '?'}`,
-    );
-  }
-
-  return { status: res.status, data };
-}
-
-async function kvGet(kv: KVNamespace | undefined, key: string): Promise<string | null> {
-  if (!kv) return null;
-  try {
-    return await kv.get(key);
-  } catch (err) {
-    console.error(`KV_GET_FAIL key=${key}`, err);
     return null;
   }
 }
 
-async function handleJoinRequest(update: Record<string, unknown>, env: Env): Promise<void> {
-  const req = update.chat_join_request as Record<string, unknown>;
-  const from = (req.from ?? {}) as Record<string, unknown>;
-  const chat = (req.chat ?? {}) as Record<string, unknown>;
-
-  const userId = from.id as number;
-  const username = (from.username as string) ?? 'no_nick';
-  const fullName = (from.full_name as string) ?? 'No name';
-  const chatId = String(chat.id);
-
-  if (!userId || !Number.isFinite(userId)) {
-    console.error('JOIN malformed: no user id', JSON.stringify(req));
-    return;
-  }
-
-  if (chatId !== env.CHANNEL_ID) {
-    console.warn(`JOIN skipped: chat ${chatId} != configured CHANNEL_ID ${env.CHANNEL_ID}`);
-    return;
-  }
-
-  const { status, data } = await tgCall(env.BOT_TOKEN, 'approveChatJoinRequest', {
-    chat_id: chatId,
-    user_id: userId,
-  });
-
-  if (data.ok) {
-    console.log(`JOIN approved: user=${userId} @${username} (${fullName})`);
-    try {
-      await env.BOT_KV?.put(`processed:${chatId}:${userId}`, String(Date.now()), {
-        expirationTtl: 31536000,
-      });
-    } catch (err) {
-      console.error(`KV_PUT_FAIL (approval still went through)`, err);
-    }
-  } else {
-  const benign = /ALREADY_PARTICIPANT|USER_ALREADY_PARTICIPANT|CHAT_ADMIN_REQUIRED|TOPIC_CLOSED/i;
-  if (!benign.test(data.description ?? '')) {
-    console.error(
-      `JOIN NOT approved: user=${userId} @${username} http=${status} description=${data.description ?? '?'}`,
-    );
-  } else {
-    console.log(`JOIN already settled: user=${userId} @${username} (${data.description})`);
-  }
-}
-}
-
-function handleMyChatMember(update: Record<string, unknown>): void {
-  const update_ = update.my_chat_member as Record<string, unknown>;
-  const chat = (update_.chat ?? {}) as Record<string, unknown>;
-  const from = (update_.from ?? {}) as Record<string, unknown>;
-  const newState = (update_.new_chat_member ?? {}) as Record<string, unknown>;
-
-  console.log(
-    `ADMIN_CHANGE chat=${chat.id} title=${chat.title ?? '?'} by=${from.username ?? from.id} ` +
-      `status=${newState.status} can_invite=${newState.can_invite_users} can_manage=${newState.can_manage_chat}`,
-  );
-
-  if (newState.status !== 'administrator' || !newState.can_invite_users) {
-    console.error('ADMIN_CHANGE WARNING: bot can no longer approve join requests in this chat');
-  }
-}
-
 async function runDiagnostics(env: Env): Promise<Record<string, unknown>> {
-  const out: Record<string, unknown> = { configured: true, checks: {} };
+  const mainToken = getMainToken(env);
+  const adminToken = getAdminToken(env);
+  const out: Record<string, unknown> = {
+    ok: Boolean(mainToken && adminToken && env.DB && env.BROADCAST_QUEUE),
+    hasMainToken: Boolean(mainToken),
+    hasAdminToken: Boolean(adminToken),
+    channelId: env.CHANNEL_ID,
+    adminIds: getAdminIds(env),
+    checks: {},
+  };
   const checks = out.checks as Record<string, unknown>;
 
-  const me = await tgCall(env.BOT_TOKEN, 'getMe');
-  checks.getMe = me.data.ok
-    ? { ok: true, username: (me.data.result as { username?: string })?.username }
-    : { ok: false, http: me.status, description: me.data.description };
+  const mainMe = await tgCall(mainToken, 'getMe');
+  checks.mainGetMe = mainMe.ok
+    ? { ok: true, id: (mainMe.result as { id?: number })?.id, username: (mainMe.result as { username?: string })?.username }
+    : { ok: false, http: mainMe.status, description: mainMe.description };
 
-  const wh = await tgCall(env.BOT_TOKEN, 'getWebhookInfo');
-  if (wh.data.ok) {
-    const info = wh.data.result as Record<string, unknown>;
-    checks.webhook = {
-      ok: true,
-      url: info.url,
-      pending_update_count: info.pending_update_count,
-      last_error_message: info.last_error_message ?? null,
-      last_error_date: info.last_error_date ?? null,
-    };
-  } else {
-    checks.webhook = { ok: false, http: wh.status, description: wh.data.description };
-  }
+  const adminMe = await tgCall(adminToken, 'getMe');
+  checks.adminGetMe = adminMe.ok
+    ? { ok: true, id: (adminMe.result as { id?: number })?.id, username: (adminMe.result as { username?: string })?.username }
+    : { ok: false, http: adminMe.status, description: adminMe.description };
 
-  const chat = await tgCall(env.BOT_TOKEN, 'getChat', { chat_id: env.CHANNEL_ID });
-  checks.chat = chat.data.ok
+  const mainWebhook = await tgCall(mainToken, 'getWebhookInfo');
+  checks.mainWebhook = mainWebhook.ok
     ? {
         ok: true,
-      title: (chat.data.result as { title?: string })?.title,
-      id: (chat.data.result as { id?: number })?.id,
-    }
-    : { ok: false, http: chat.status, description: chat.data.description };
+        url: (mainWebhook.result as Record<string, unknown>)?.url,
+        pending_update_count: (mainWebhook.result as Record<string, unknown>)?.pending_update_count,
+        last_error_message: (mainWebhook.result as Record<string, unknown>)?.last_error_message ?? null,
+      }
+    : { ok: false, http: mainWebhook.status, description: mainWebhook.description };
 
-  if (me.data.ok) {
-    const botId = (me.data.result as { id?: number })?.id;
-    const member = await tgCall(env.BOT_TOKEN, 'getChatMember', {
+  const adminWebhook = await tgCall(adminToken, 'getWebhookInfo');
+  checks.adminWebhook = adminWebhook.ok
+    ? {
+        ok: true,
+        url: (adminWebhook.result as Record<string, unknown>)?.url,
+        pending_update_count: (adminWebhook.result as Record<string, unknown>)?.pending_update_count,
+        last_error_message: (adminWebhook.result as Record<string, unknown>)?.last_error_message ?? null,
+      }
+    : { ok: false, http: adminWebhook.status, description: adminWebhook.description };
+
+  const chat = await tgCall(mainToken, 'getChat', { chat_id: env.CHANNEL_ID });
+  checks.chat = chat.ok
+    ? { ok: true, id: (chat.result as { id?: number })?.id, title: (chat.result as { title?: string })?.title }
+    : { ok: false, http: chat.status, description: chat.description };
+
+  if (mainMe.ok) {
+    const botId = (mainMe.result as { id?: number })?.id;
+    const member = await tgCall(mainToken, 'getChatMember', {
       chat_id: env.CHANNEL_ID,
       user_id: botId,
     });
-    checks.botMembership = member.data.ok
-      ? { ok: true, status: (member.data.result as { status?: string })?.status }
-      : { ok: false, http: member.status, description: member.data.description };
+    checks.botMembership = member.ok
+      ? { ok: true, status: (member.result as { status?: string })?.status }
+      : { ok: false, http: member.status, description: member.description };
+  }
+
+  try {
+    checks.stats = await getStats(env.DB);
+  } catch (err) {
+    checks.stats = { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 
   try {
     await env.BOT_KV?.put('diag:probe', String(Date.now()), { expirationTtl: 60 });
-    checks.kv = { ok: true };
+    checks.kv = { ok: Boolean(env.BOT_KV) };
   } catch (err) {
     checks.kv = { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
+
+  checks.queue = { ok: Boolean(env.BROADCAST_QUEUE) };
+  checks.secrets = {
+    mainWebhookSecret: Boolean(env.WEBHOOK_SECRET),
+    adminWebhookSecret: Boolean(env.ADMIN_WEBHOOK_SECRET),
+  };
 
   return out;
 }
@@ -177,73 +108,78 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
-    if (!env.BOT_TOKEN) {
-      return new Response('BOT_TOKEN is not configured', { status: 500 });
-    }
-
-    if (request.method === 'GET' && url.pathname === '/health') {
+    if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
       return json({
+        service: 'autopriniyatie-bot',
         ok: true,
-        hasToken: true,
+        hasMainToken: Boolean(getMainToken(env)),
+        hasAdminToken: Boolean(getAdminToken(env)),
         channelId: env.CHANNEL_ID,
         kvBound: Boolean(env.BOT_KV),
-        webhookSecretRequired: Boolean(env.WEBHOOK_SECRET),
+        dbBound: Boolean(env.DB),
+        queueBound: Boolean(env.BROADCAST_QUEUE),
+        mainWebhookSecretRequired: Boolean(env.WEBHOOK_SECRET),
+        adminWebhookSecretRequired: Boolean(env.ADMIN_WEBHOOK_SECRET),
       });
     }
 
     if (request.method === 'GET' && url.pathname === '/diagnose') {
       if (!env.DIAG_KEY || request.headers.get('X-Diag-Key') !== env.DIAG_KEY) {
-        return new Response('forbidden', { status: 403 });
+        return text('forbidden', 403);
       }
       return json(await runDiagnostics(env));
     }
 
-    if (url.pathname !== '/webhook') {
-      return new Response('Not Found', { status: 404 });
-    }
-
-    if (request.method === 'GET') {
-      return new Response('OK', { status: 200 });
-    }
-
-    if (request.method !== 'POST') {
-      return new Response('Method Not Allowed', { status: 405 });
-    }
-
-    if (env.WEBHOOK_SECRET) {
-      const provided = request.headers.get('X-Telegram-Bot-Api-Secret-Token');
-      if (provided !== env.WEBHOOK_SECRET) {
-        console.warn(`WEBHOOK rejected: bad secret token from ${request.headers.get('cf-connecting-ip') ?? '?'}`);
-        return new Response('forbidden', { status: 403 });
+    if (url.pathname === '/webhook') {
+      if (request.method === 'GET') return text('OK');
+      if (request.method !== 'POST') return text('Method Not Allowed', 405);
+      if (!getMainToken(env)) return text('MAIN_BOT_TOKEN is not configured', 500);
+      if (!checkSecret(request.headers.get('X-Telegram-Bot-Api-Secret-Token'), env.WEBHOOK_SECRET)) {
+        console.warn(`MAIN webhook rejected: bad secret from ${request.headers.get('cf-connecting-ip') ?? '?'}`);
+        return text('forbidden', 403);
       }
-    }
 
-    let update: Record<string, unknown>;
-    try {
-      update = (await request.json()) as Record<string, unknown>;
-    } catch {
-      console.error('WEBHOOK invalid JSON body');
-      return new Response('bad request', { status: 400 });
-    }
+      const update = await readUpdate(request);
+      if (!update) return text('bad request', 400);
+      if (!update.update_id) return json({ ok: true });
 
-    if (!update?.update_id) {
-      console.warn('WEBHOOK update without update_id', JSON.stringify(update));
+      try {
+        await handleMainUpdate(update, env, ctx);
+      } catch (err) {
+        console.error(`MAIN HANDLER FAIL update_id=${update.update_id}`, err);
+      }
       return json({ ok: true });
     }
 
-    try {
-      if (update.chat_join_request) {
-        await handleJoinRequest(update, env);
-      } else if (update.my_chat_member) {
-        handleMyChatMember(update);
-      } else {
-        const type = Object.keys(update).find((k) => k !== 'update_id') ?? 'unknown';
-        console.log(`UPDATE ignored type=${type}`);
+    if (url.pathname === '/admin/webhook') {
+      if (request.method === 'GET') return text('OK');
+      if (request.method !== 'POST') return text('Method Not Allowed', 405);
+      if (!getAdminToken(env)) return text('ADMIN_BOT_TOKEN is not configured', 500);
+      if (!checkSecret(request.headers.get('X-Telegram-Bot-Api-Secret-Token'), env.ADMIN_WEBHOOK_SECRET)) {
+        console.warn(`ADMIN webhook rejected: bad secret from ${request.headers.get('cf-connecting-ip') ?? '?'}`);
+        return text('forbidden', 403);
       }
-    } catch (err) {
-      console.error(`HANDLER FAIL update_id=${update.update_id}`, err);
+
+      const update = await readUpdate(request);
+      if (!update) return text('bad request', 400);
+      if (!update.update_id) return json({ ok: true });
+
+      try {
+        await handleAdminUpdate(update, env, ctx);
+      } catch (err) {
+        console.error(`ADMIN HANDLER FAIL update_id=${update.update_id}`, err);
+      }
+      return json({ ok: true });
     }
 
-    return json({ ok: true });
+    return text('Not Found', 404);
+  },
+
+  async queue(batch: MessageBatch<QueueJob>, env: Env, ctx: ExecutionContext): Promise<void> {
+    await handleQueue(batch, env, ctx);
+  },
+
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(handleScheduled(env, event, ctx));
   },
 };
